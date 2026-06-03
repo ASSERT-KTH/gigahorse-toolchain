@@ -51,6 +51,18 @@ ln -sf libsoufflenum.so "$TOOLCHAIN/souffle-addon/libfunctors.so"
 docker rm $CID
 ```
 
+> **Note:** The `libsoufflenum.so` from the Docker image is older and lacks the `hex_normalized`
+> functor (needed by `clientlib/multi_contract.dl` and any client that imports it).  Rebuild it
+> from the submodule source so clients that use `@hex_normalized` can link:
+>
+> ```bash
+> cd "$TOOLCHAIN/souffle-addon"
+> CPLUS_INCLUDE_PATH="$GIGAHORSE_ROOT/include" make libsoufflenum.so
+> ```
+>
+> This requires `libz3-dev` (`apt install libz3-dev`).  The `libfunctors.so` symlink is
+> recreated automatically by `make`.
+
 ## Patch souffle-compile.py
 
 `souffle-compile.py` detects the `include/souffle/` directory sitting next to
