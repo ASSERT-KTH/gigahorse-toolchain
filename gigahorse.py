@@ -274,8 +274,16 @@ def analyze_contract(index: int, contract_filename: str, result_queue, fact_gene
             return
 
         # Do not attempt to decompile for earlier timeouts when using --rerun_clients
-        if args.rerun_clients and not fact_generator.decomp_out_produced(out_dir):
-            raise TimeoutException()
+        # Use a direct file check as fallback when fact_generator state is missing (e.g. MixedFactGenerator
+        # only populates out_dir_to_gen during generate_facts, which is skipped for existing dirs)
+        if args.rerun_clients:
+            try:
+                decomp_ok = fact_generator.decomp_out_produced(out_dir)
+            except KeyError:
+                decomp_ok = (os.path.exists(join(out_dir, 'Analytics_JumpToMany.csv')) and
+                             os.path.exists(join(out_dir, 'TAC_Def.csv')))
+            if not decomp_ok:
+                raise TimeoutException()
 
         client_start = time.time()
         timeouts, errors = analysis_executor.run_clients(souffle_clients, other_clients, out_dir, out_dir, client_start)

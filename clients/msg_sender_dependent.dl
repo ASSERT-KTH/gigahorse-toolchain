@@ -1,0 +1,83 @@
+// 检查msg.sender的值是否流向了状态变量，如果是，则进一步检查该状态变量的值是否流向了控制流所依赖的变量
+// 引入 Gigahorse 工具链的所有预定义关系
+#include "../clientlib/decompiler_imports.dl"
+#include "../clientlib/flows.dl"
+
+// IsConstructor: no direct equivalent in current gigahorse; stub as always-false
+.decl IsConstructor(func: Function)
+IsConstructor(func) :- IsPublicFunction(func), 1 = 2.
+
+// VarPointsTo(dest, src): src's value flows to dest — maps to DataFlows(src, dest)
+.decl VarPointsTo(dest: Variable, src: Variable)
+VarPointsTo(dest, src) :- DataFlows(src, dest).
+
+// 最终规则：如果一个条件跳转（if/require/assert）依赖于一个在构造函数中
+// 被 msg.sender 污染的状态变量，则此规则为真。
+// 输出的是导致问题的 JUMPI 语句。
+.decl UnexpectedMsgSenderDependent(stmt: Statement)
+.output UnexpectedMsgSenderDependent
+
+
+// --- 中间步骤 ---
+// 为了逻辑清晰，我们定义一些中间关系来分步解决问题。
+
+// 步骤 1: 找出在构造函数中代表 msg.sender 的变量 (我们的初始污点源)
+// TaintedByMsgSenderInConstructor(func, var) 表示：
+// 在构造函数 func 中，变量 var 代表了 msg.sender 的值。
+.decl TaintedByMsgSenderInConstructor(func: Function, var: Variable)
+
+TaintedByMsgSenderInConstructor(func, caller_var) :-
+// 必须是一个构造函数
+    IsConstructor(func),
+    // 在该函数中有一个 CALLER 指令 (即 msg.sender)
+    CALLER(stmt, caller_var), // CALLER来自于tac_instructions.d中的宏定义：MAKEZEROOP(CALLER). 是正确的
+    // 确保指令和函数是对应的
+    Statement_Function(stmt, func).
+
+
+// 步骤 2: 找出被 msg.sender 污染的状态变量槽位
+// TaintedStateSlot(slot_var) 表示：
+// 变量 slot_var 代表一个状态变量的存储槽位地址，
+// 并且写入该槽位的值受到了构造函数中 msg.sender 的污染。
+.decl TaintedStateSlot(slot_var: Variable)
+
+TaintedStateSlot(sstore_slot_var) :-
+// 找到一个状态变量写入操作 (SSTORE)
+    SSTORE(sstore_stmt, sstore_slot_var, value_var),
+    // 获取该 SSTORE 所在的函数
+    Statement_Function(sstore_stmt, func),
+    // 找到在构造函数中代表 msg.sender 的变量 (使用步骤1的结果)
+    TaintedByMsgSenderInConstructor(func, sender_var),
+    // 关键：检查 msg.sender 的值 (sender_var) 是否能流向 (PointsTo)
+    // SSTORE 写入的值 (value_var)。这是第一段污点传播。
+    VarPointsTo(value_var, sender_var).
+
+
+// 步骤 3: 找出由状态变量控制的条件跳转
+// StateVarControlsJump(slot_var, jump_stmt) 表示：
+// 条件跳转语句 jump_stmt 的判断条件，其值来源于对 slot_var 所代表的状态变量的读取。
+.decl StateVarControlsJump(slot_var: Variable, jump_stmt: Statement)
+
+StateVarControlsJump(sload_slot_var, jumpi_stmt) :-
+// 找到一个条件跳转指令 (JUMPI)
+    JUMPI(jumpi_stmt, _, cond_var),
+    // 找到一个状态变量读取操作 (SLOAD)
+    SLOAD(sload_stmt, sload_slot_var, read_value_var),
+    // 关键：检查 SLOAD 读取出的值 (read_value_var) 是否能流向 (PointsTo)
+    // JUMPI 的条件变量 (cond_var)。这是第二段污点传播。
+    VarPointsTo(cond_var, read_value_var).
+
+
+// --- 最终规则定义 ---
+// 将步骤2和步骤3连接起来，形成完整的逻辑链条。
+
+UnexpectedMsgSenderDependent(jumpi_stmt) :-
+// 首先，我们找到了一个被 msg.sender 污染的状态槽位 (TaintedStateSlot)
+    TaintedStateSlot(tainted_slot_var),
+    // 其次，我们找到了一个被状态变量控制的条件跳转 (StateVarControlsJump)
+    StateVarControlsJump(control_slot_var, jumpi_stmt),
+    // 最关键的一步：确认这两者是同一个状态变量。
+    // 我们通过检查它们的槽位变量是否可以相互指向来确定。
+    // 这比直接比较变量名 `tainted_slot_var == control_slot_var` 更为健壮，
+    // 因为它能处理变量在传递过程中被赋给新变量的情况。
+    VarPointsTo(control_slot_var, tainted_slot_var).

@@ -1,0 +1,176 @@
+/**
+ * Reentrancy and related vulnerability detector.
+ *
+ * Detects three patterns:
+ *   1. REENTRANCY   — state write (SSTORE) reachable after external call in the
+ *                     same function (classic check-effects-interactions violation).
+ *   2. TX_ORIGIN    — tx.origin (ORIGIN) value flows into a comparison used to
+ *                     guard execution, instead of the safer msg.sender (CALLER).
+ *   3. UNCHECKED_CALL — the success bit returned by CALL/DELEGATECALL is never
+ *                       read by any downstream statement.
+ *
+ * Usage:
+ *   gigahorse.py -C clients/reentrancy.dl <contracts…>
+ *
+ * Output relations (written as CSVs in .temp/<contract>/out/):
+ *   Reentrancy.csv, TxOriginAuth.csv, UncheckedCall.csv, VulnSummary.csv
+ */
+
+#include "../clientlib/decompiler_imports.dl"
+#include "../clientlib/flows.dl"
+
+// ---------------------------------------------------------------------------
+// Helpers: intra-procedural CFG reachability (block level, within a function)
+// ---------------------------------------------------------------------------
+
+/**
+ * BlockReachesBlock(src, dst, func): dst is reachable from src via local CFG
+ * edges, with both blocks belonging to the same function.
+ */
+.decl BlockReachesBlock(src: Block, dst: Block, func: Function)
+
+BlockReachesBlock(src, dst, func) :-
+    LocalBlockEdge(src, dst),
+    InFunction(src, func),
+    InFunction(dst, func).
+
+BlockReachesBlock(src, dst, func) :-
+    BlockReachesBlock(src, mid, func),
+    LocalBlockEdge(mid, dst),
+    InFunction(dst, func).
+
+// ---------------------------------------------------------------------------
+// 1. REENTRANCY
+//    A public function issues an external CALL and then, in a reachable block,
+//    executes an SSTORE — the classic check-effects-interactions violation.
+// ---------------------------------------------------------------------------
+
+/**
+ * ExternalCallInFunction(callStmt, func): callStmt is a CALL inside func that
+ * might transfer control to untrusted code.  STATICCALL cannot modify state so
+ * it is excluded; DELEGATECALL is covered separately by pattern 3.
+ */
+.decl ExternalCallInFunction(callStmt: Statement, callBlock: Block, func: Function)
+
+ExternalCallInFunction(callStmt, callBlock, func) :-
+    Statement_Opcode(callStmt, "CALL"),
+    Statement_Block(callStmt, callBlock),
+    InFunction(callBlock, func).
+
+ExternalCallInFunction(callStmt, callBlock, func) :-
+    Statement_Opcode(callStmt, "DELEGATECALL"),
+    Statement_Block(callStmt, callBlock),
+    InFunction(callBlock, func).
+
+/**
+ * SStoreInFunction(storeStmt, storeBlock, func): an SSTORE inside func.
+ */
+.decl SStoreInFunction(storeStmt: Statement, storeBlock: Block, func: Function)
+
+SStoreInFunction(storeStmt, storeBlock, func) :-
+    Statement_Opcode(storeStmt, "SSTORE"),
+    Statement_Block(storeStmt, storeBlock),
+    InFunction(storeBlock, func).
+
+/**
+ * Reentrancy(callStmt, storeStmt, funcName):
+ *   Reported when an SSTORE is reachable after an external CALL in the same
+ *   public function.  The function name is resolved via HighLevelFunctionName.
+ */
+.decl Reentrancy(callStmt: Statement, storeStmt: Statement, funcName: symbol)
+.output Reentrancy
+
+Reentrancy(callStmt, storeStmt, funcName) :-
+    ExternalCallInFunction(callStmt, callBlock, func),
+    SStoreInFunction(storeStmt, storeBlock, func),
+    // storeBlock reachable from callBlock (strict: callBlock != storeBlock)
+    BlockReachesBlock(callBlock, storeBlock, func),
+    // limit to publicly reachable functions to reduce noise
+    IsPublicFunction(func),
+    HighLevelFunctionName(func, funcName).
+
+// ---------------------------------------------------------------------------
+// 2. TX_ORIGIN AUTH
+//    ORIGIN (tx.origin) flows into a comparison operator (EQ).  Using tx.origin
+//    for access control is dangerous because it can be spoofed via a relay.
+// ---------------------------------------------------------------------------
+
+/**
+ * OriginFlowsToEQ(eqStmt, func):
+ *   The output of an ORIGIN instruction reaches (via data flow) one of the
+ *   input operands of an EQ statement inside the same function.
+ */
+.decl OriginFlowsToEQ(eqStmt: Statement, func: Function)
+
+OriginFlowsToEQ(eqStmt, func) :-
+    Statement_Opcode(originStmt, "ORIGIN"),
+    Statement_Defines(originStmt, originVar, _),
+    Statement_Opcode(eqStmt, "EQ"),
+    Statement_Uses(eqStmt, eqInput, _),
+    DataFlows(originVar, eqInput),
+    Statement_Block(eqStmt, block),
+    InFunction(block, func).
+
+/**
+ * TxOriginAuth(eqStmt, funcName):
+ *   Public function that uses tx.origin in a comparison — likely for auth.
+ */
+.decl TxOriginAuth(eqStmt: Statement, funcName: symbol)
+.output TxOriginAuth
+
+TxOriginAuth(eqStmt, funcName) :-
+    OriginFlowsToEQ(eqStmt, func),
+    IsPublicFunction(func),
+    HighLevelFunctionName(func, funcName).
+
+// ---------------------------------------------------------------------------
+// 3. UNCHECKED EXTERNAL CALL
+//    The success boolean produced by a CALL is never consumed by any statement.
+//    A failed call is silently ignored, which can lead to lost funds or
+//    inconsistent state.
+// ---------------------------------------------------------------------------
+
+/**
+ * CallSuccessVar(callStmt, successVar, func):
+ *   Maps each CALL to its success output variable and containing function.
+ */
+.decl CallSuccessVar(callStmt: Statement, successVar: Variable, func: Function)
+
+CallSuccessVar(callStmt, successVar, func) :-
+    CALL(callStmt, _, _, _, _, _, _, _, successVar),
+    Statement_Block(callStmt, block),
+    InFunction(block, func).
+
+/**
+ * UncheckedCall(callStmt, funcName):
+ *   The success variable of this CALL is never used downstream.
+ */
+.decl UncheckedCall(callStmt: Statement, funcName: symbol)
+.output UncheckedCall
+
+UncheckedCall(callStmt, funcName) :-
+    CallSuccessVar(callStmt, successVar, func),
+    !Statement_Uses(_, successVar, _),
+    IsPublicFunction(func),
+    HighLevelFunctionName(func, funcName).
+
+// ---------------------------------------------------------------------------
+// Summary: one row per (contract function, vulnerability type) pair
+// ---------------------------------------------------------------------------
+
+/**
+ * VulnSummary(funcName, vulnType):
+ *   Aggregated view — one row per distinct (function, vulnerability) pair,
+ *   convenient for quick triage.
+ */
+.decl VulnSummary(funcName: symbol, vulnType: symbol)
+.output VulnSummary
+
+VulnSummary(funcName, "REENTRANCY") :-
+    Reentrancy(_, _, funcName).
+
+VulnSummary(funcName, "TX_ORIGIN_AUTH") :-
+    TxOriginAuth(_, funcName).
+
+VulnSummary(funcName, "UNCHECKED_CALL") :-
+    UncheckedCall(_, funcName).

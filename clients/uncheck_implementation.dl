@@ -1,0 +1,43 @@
+#include "../clientlib/decompiler_imports.dl"
+#include "../clientlib/flows.dl"
+
+// --- 1. 污点源识别 ---
+
+// Clone Function
+.decl IsCloneFunction(fn: Function)
+.output IsCloneFunction
+
+IsCloneFunction(fn) :-
+    HighLevelFunctionName(fn, "clone"); // 或的关系
+    HighLevelFunctionName(fn, "cloneDeterministic").
+
+// 识别 `implementation` 地址的潜在来源：针对 clone 和 cloneDeterministic 函数的第一个参数
+.decl ImplementationSource(v: Variable)
+
+ImplementationSource(implVar) :-
+    FunctionCallReturn(block,fn,_), // 是一个函数调用语句
+    IsCloneFunction(fn), // 调用的是Clone类型的函数
+    ActualArgs(block,implVar,1). // 是Clone类型的函数的第一个参数 TODO 待验证
+
+
+// --- 2. 污点传播 (DataFlows 已由 Gigahorse 提供) ---
+// 我们将使用 DataFlows(from, to) 来跟踪污点。
+
+// --- 3. 安全检查模式识别 ---
+
+// 检查地址的合法性：是否非零 / 有代码，这里将条件弱化为：是否对地址进行“任何”约束
+.decl TaintedConditionalVars(checkedVar: Variable, checkStmt: Statement)
+TaintedConditionalVars(checkedVar, jmpStmt) :-
+    JUMPI(jmpStmt, _, condVar), // 有一个条件跳转依赖于此条件变量
+    DataFlows(checkedVar, condVar).          // checkedVar 流向条件变量
+
+
+
+// 未验证的 `implementation` 地址
+.decl MissingImplementationValidation(checkedVar: Variable)
+.output MissingImplementationValidation
+
+MissingImplementationValidation(checkedVar) :-
+    ImplementationSource(checkedVar), // 这是一个潜在的 implementation 地址
+    // 并且它没有被进行任何形式的约束
+    !TaintedConditionalVars(checkedVar, _).

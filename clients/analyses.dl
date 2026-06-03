@@ -1,0 +1,181 @@
+#include "../clientlib/decompiler_imports.dl"
+
+// Utils:
+// Block_Head, Block_Tail, LocalBlockEdge
+
+.decl BlocksInSameFunction(block1: Block, block2: Block)
+BlocksInSameFunction(block1, block2) :-
+  InFunction(block1, fun),
+  InFunction(block2, fun).
+
+.decl Reachable(block1: Block, block2: Block)
+Reachable(block1, block2):-
+  LocalBlockEdge(block1, block2),
+  BlocksInSameFunction(block1, block2).
+
+Reachable(block1, block2):-
+  Reachable(block1, blockMid),
+  LocalBlockEdge(blockMid, block2).
+
+.decl ReachableBypassing(block1: Block, block2: Block, blockBypass: Block)
+ReachableBypassing(block1, block2, blockBypass) :-
+  LocalBlockEdge(block1, block2),
+  BlocksInSameFunction(block1, blockBypass),
+  blockBypass != block1,
+  blockBypass != block2.
+
+ReachableBypassing(block1, block2, blockBypass) :-
+  ReachableBypassing(block1, blockInterm, blockBypass),
+  LocalBlockEdge(blockInterm, block2),
+  block2 != blockBypass.
+//  blockInterm != blockBypass   // is implicitly done
+
+.decl MultipleExits(fun: Function)
+MultipleExits(fun):-
+  FunctionExit(block1),
+  FunctionExit(block2),
+  InFunction(block1, fun),
+  InFunction(block2, fun),
+  block1 != block2.
+
+
+// 1) Control Flow:
+.decl Dominates(block1: Block, block2: Block)
+.decl PostDominates(block1: Block, block2: Block)
+.decl LoopHeadBlock(block: Block)
+.decl Controls(stmt: Statement, block: Block)
+
+
+Dominates(block1, block2):-
+  BlocksInSameFunction(block1, block2),
+  FunctionEntry(block1),
+  block1 != block2.
+
+Dominates(block1, block2):-
+  InFunction(block1, fun),
+  InFunction(block2, fun),
+  InFunction(blockEntr, fun),
+  FunctionEntry(blockEntr),
+  // Reachable(blockEntr, block2), // Always true
+  !ReachableBypassing(blockEntr, block2, block1),
+  block1 != block2,
+  blockEntr != block1,
+  blockEntr != block2.
+
+//PostDominates(block1, block2):-
+//  InFunction(block1, fun),
+//  InFunction(block2, fun),
+//  !MultipleExits(fun),
+//  Reachable(block2, block1),
+//  block1 != block2.
+
+PostDominates(block1, block2):-
+  FunctionExit(blockExit),
+  InFunction(block1, fun),
+  InFunction(block2, fun),
+  InFunction(blockExit, fun),
+  Reachable(block2, blockExit),
+  block1 != block2,
+  blockExit != block1,
+  blockExit != block2,
+  !ReachableBypassing(block2, blockExit, block1).
+
+.decl test(block1: Block, block2: Block, block3: Block)
+test(block1, block2, block3):-
+  FunctionExit(block3),
+  InFunction(block1, fun),
+  InFunction(block2, fun),
+  InFunction(block3, fun),
+  Reachable(block2, block3),
+  !ReachableBypassing(block2, block3, block1).
+
+.output test
+
+.output Reachable
+.output ReachableBypassing
+
+// Idea: block is a loop-head if it dominates a block2
+// that has an edge to block
+LoopHeadBlock(block):-
+  LocalBlockEdge(block2, block),
+  Dominates(block, block2).
+
+// A stmt controls a block if its condBlock dominates block
+// and either one of condBlock's successors is or dominates block
+Controls(stmt, block):- 
+  Statement_Opcode(stmt, "JUMPI"),
+  Statement_Block(stmt, condBlock),
+  Dominates(condBlock, block),
+  LocalBlockEdge(condBlock, blockTrue),
+  LocalBlockEdge(condBlock, blockFalse),
+  blockTrue != blockFalse,
+  (blockTrue = block;
+   blockFalse = block;
+   Dominates(blockTrue, block);
+   Dominates(blockFalse, block)).
+  //!PostDominates(block, condBlock).
+
+.output Dominates
+.output PostDominates
+.output LoopHeadBlock
+.output Controls
+
+// 2) Data Flow:
+
+// Utils:
+// Statement_Uses, Statement_Defines, CallGraphEdge, CallPrivate
+
+.decl Flows(fromVar: Variable, toVar: Variable)
+
+// (In)Direct Assignment, everything except function calls
+Flows(fromVar, toVar):-
+  Statement_Uses(stmt, fromVar, _),
+  !Statement_Opcode(stmt, "CALLPRIVATE"),
+  Statement_Defines(stmt, toVar, _).
+
+// Function call argument flow
+Flows(fromVar, toVar):-
+  Statement_Uses(stmt_use, fromVar, pos),
+  Statement_Opcode(stmt_use, "CALLPRIVATE"),
+  pos > 0,
+  Statement_Block(stmt_use, block),
+  CallGraphEdge(block, f),
+  FormalArgs(f, toVar, pos - 1).
+
+// Function return argument flow
+Flows(fromVar, toVar):-
+  FormalReturnArgs(f, fromVar, pos),
+  CallGraphEdge(block, f),
+  ActualReturnArgs(block, toVar, pos).
+
+ .output Flows
+
+ // 3) Client Analysis:
+
+.decl Stmt_Path(from: Statement, to: Statement)
+Stmt_Path(from, to):-
+  Statement_Next(from, to).
+
+// Not sure if needed, so made it just to be safe 
+Stmt_Path(from, to):-
+  Block_Tail(prev, from),
+  LocalBlockEdge(prev, next),
+  Block_Head(next, to).
+
+Stmt_Path(from, to):-
+  Stmt_Path(from, middle),
+  Stmt_Path(middle, to).
+
+.output Stmt_Path
+
+.decl Reentrancy(callStmt: Statement, storeStmt: Statement)
+Reentrancy(callStmt, storeStmt):-
+  Stmt_Path(callStmt, storeStmt),
+  Statement_Opcode(callStmt, "CALL"),
+  Statement_Opcode(storeStmt, "SSTORE"),
+  Statement_Uses(callStmt, gas, 0),
+  !Variable_Value(gas, "0x8fc").
+
+.output Reentrancy
+
+// .output FunctionExit // Debugging
